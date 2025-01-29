@@ -1,0 +1,513 @@
+import logging
+import os
+import time
+import random
+import re
+import json
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, CallbackContext
+from telegram.constants import ParseMode
+from gtts import gTTS
+import sympy as sp 
+from datetime import datetime, timedelta
+from langchain_ollama import OllamaLLM
+import sys
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+import torch
+from PIL import Image
+import pytesseract
+from rembg import remove
+from io import BytesIO
+import asyncio
+import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pytz import timezone
+import cv2
+import pytesseract
+import numpy as np
+from telegram.ext import CallbackContext
+
+
+# Set timezone to UTC (make sure you use the correct pytz timezone object)
+timezone_utc = pytz.timezone("Asia/Kolkata")  # Explicit timezone string
+scheduler = AsyncIOScheduler(timezone=pytz.timezone('Asia/Kolkata'))
+print(pytz.timezone('Asia/Kolkata'))
+
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Bot configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME")
+
+# Dictionary to store user data
+user_data = {}
+logged_in_users = set()
+DATA_FILE = "user_data.json"
+
+# Initialize the Ollama Mistral model
+ollama_model = OllamaLLM(model="mistral")
+
+# Image generation setup
+device = "cpu"  # Use CPU for image generation
+model_id = "stabilityai/stable-diffusion-2-1"
+pipe = StableDiffusionPipeline.from_pretrained(model_id)
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+pipe.enable_attention_slicing()
+pipe = pipe.to(device)
+
+# Bot command functions
+async def start(update: Update, context: CallbackContext):
+    await update.message.reply_text("Hi! I am your AI bot powered by koko. How can I help you?")
+
+# Handle user message
+async def handle_message(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    
+    # Skip AI response for commands
+    if update.message.text.startswith(('/', 'help', 'start', 'create', 'login', 'logout', 'speak', 'calc', 'restart', 'image', 'listen')):
+        return
+
+    if user_id not in logged_in_users and update.message.text not in ["/start", "/help", "/login"]:
+        await update.message.reply_text("You must log in to use AI functionality. Use /login to log in.")
+        return
+
+    user_message = update.message.text
+
+    try:
+        # Use the Ollama model to generate a response to the user's message
+        response = ollama_model.invoke(user_message)
+
+        # Save the response for /listen if necessary
+        context.chat_data["last_response"] = response
+
+        await update.message.reply_text(response)
+
+    except Exception as e:
+        logger.error(f"Error while generating response: {e}")
+        await update.message.reply_text("Oops! Something went wrong. Please try again later.")
+
+# Save and load user data
+def save_user_data():
+    with open(DATA_FILE, "w") as f:
+        json.dump(user_data, f)
+
+def load_user_data():
+    global user_data
+    try:
+        with open(DATA_FILE, "r") as f:
+            user_data = json.load(f)
+    except FileNotFoundError:
+        user_data = {}
+
+# OTP generation
+def generate_otp():
+    return random.randint(100000, 999999)
+
+# Validate password criteria
+def is_valid_password(password):
+    return (
+        len(password) >= 8 and
+        bool(re.search(r'[A-Za-z]', password)) and
+        bool(re.search(r'\d', password)) and
+        bool(re.search(r'[!@#$%^&*(),.?":{}|<>]', password))
+    )
+
+# Conversation states for account creation
+NAME, USERNAME, PHONE, VERIFY_OTP, SET_PASSWORD, LOGIN, VERIFY_LOGIN, RESEND_OTP = range(8)
+
+# Middleware to restrict access
+async def require_login(update: Update, context: CallbackContext):
+    if update.effective_user.id not in logged_in_users and update.message.text not in ["/start", "/help", "/login"]:
+        await update.message.reply_text("You must log in to use this bot. Use /login to log in.")
+        return True
+    return False
+
+# Commands
+async def start_command(update: Update, context: CallbackContext):
+    await update.message.reply_text(
+        "Hello! I am Koko, your friendly bot. Log in to access my features.\n\n"
+        "Use /create to create an account, /login to log in, or /help to learn more about what I can do!"
+    )
+
+async def help_command(update: Update, context: CallbackContext):
+    await update.message.reply_text(
+        "Welcome to Koko Bot! Here's how I can help you:\n\n"
+        "Features:\n"
+        "- Create an account and log in to save your preferences and access features.\n"
+        "- Chat with me about anything you like, and I'll try to provide useful responses!\n"
+        "- Convert text to speech with /speak.\n"
+        "- Solve mathematical equations or perform calculations with /calc.\n"
+        "- Generate images using text prompts with /image.\n"
+        "- Convert bot responses to audio with /listen.\n\n"
+        "- Remove image backgrounds with /removebg (send an image after using this command).\n\n"
+        "Commands:\n"
+        "/start - Start the bot.\n"
+        "/create - Create a new account.\n"
+        "/login - Log in to your account.\n"
+        "/logout - Log out of your account.\n"
+        "/speak <text> - Convert text to speech.\n"
+        "/calc <operation> - Perform calculations or solve equations.\n"
+        "/image <prompt> - Generate an image based on your prompt.\n"
+        "/listen - Convert the bot's last response to audio format.\n"
+        "/removebg - Remove the background of an image (send an image after this command).\n"
+        "/restart - Restart the bot (start from the beginning).\n\n"
+        "Log in to unlock all features and start exploring!"
+    )
+    
+
+async def speak_command(update: Update, context: CallbackContext):
+    if await require_login(update, context):
+        return
+
+    if context.args:
+        text = " ".join(context.args)
+        try:
+            tts = gTTS(text=text, lang='en', slow=False)
+            audio_file = "speech.mp3"
+            tts.save(audio_file)
+            with open(audio_file, "rb") as audio:
+                await update.message.reply_audio(audio)
+            os.remove(audio_file)
+        except Exception as e:
+            await update.message.reply_text(f"An error occurred: {e}")
+    else:
+        await update.message.reply_text("Provide text after /speak to convert it to speech.")
+
+# Other function definitions remain unchanged...
+async def calc_command(update: Update, context: CallbackContext):
+    if await require_login(update, context):
+        return
+
+    if context.args:
+        expression = " ".join(context.args)
+        try:
+            result = eval(expression)
+            await update.message.reply_text(f"The result of {expression} is {result}.")
+            # Save the response for /listen
+            context.chat_data["last_response"] = f"The result of {expression} is {result}."
+        except:
+            try:
+                x = sp.symbols('x')
+                equation = sp.sympify(expression)
+                solution = sp.solve(equation, x)
+                await update.message.reply_text(f"The solution to {expression} is {solution}.")
+                # Save the response for /listen
+                context.chat_data["last_response"] = f"The solution to {expression} is {solution}."
+            except Exception as e:
+                await update.message.reply_text(f"Error: {e}")
+                context.chat_data["last_response"] = f"Error: {e}"
+    else:
+        await update.message.reply_text("Usage: /calc <operation or equation>")
+    
+
+# Image Text Reading Feature
+async def handle_image(update: Update, context: CallbackContext):
+    if await require_login(update, context):
+        return
+
+    if context.chat_data.get("expecting_removebg", False):  
+        context.chat_data["expecting_removebg"] = False  # Reset the flag
+        await remove_background(update, context)  # Call the remove background function
+        return
+
+    try:
+        # Process the image for text extraction
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        img = Image.open(BytesIO(photo_bytes))
+        extracted_text = pytesseract.image_to_string(img).strip()
+
+        if extracted_text:
+            logger.info(f"Extracted Text: {extracted_text}")
+            response = ollama_model.invoke(extracted_text)
+            await update.message.reply_text(response)
+        else:
+            await update.message.reply_text("Sorry, I couldn't detect any text in the image.")
+    except Exception as e:
+        logger.error(f"Error processing image text: {e}")
+        await update.message.reply_text("Oops! Something went wrong while reading the image.")
+
+
+
+# Account creation and login
+async def create_account(update: Update, context: CallbackContext):
+    await update.message.reply_text("Enter your name:")
+    return NAME
+
+async def handle_name(update: Update, context: CallbackContext):
+    context.user_data["name"] = update.message.text
+    await update.message.reply_text("Enter a username:")
+    return USERNAME
+
+async def handle_username(update: Update, context: CallbackContext):
+    username = update.message.text
+    if username in user_data:
+        await update.message.reply_text("This username is already taken. Choose a different one.")
+        return USERNAME
+    context.user_data["username"] = username
+    await update.message.reply_text("Enter your phone number:")
+    return PHONE
+
+async def handle_phone(update: Update, context: CallbackContext):
+    context.user_data["phone"] = update.message.text
+    context.user_data["otp"] = generate_otp()
+    context.user_data["otp_time"] = time.time()
+    await update.message.reply_text(
+        f"Your OTP is: <b>{context.user_data['otp']}</b> (Expires in 60 seconds)",
+        parse_mode=ParseMode.HTML
+    )
+    return VERIFY_OTP
+
+async def verify_otp(update: Update, context: CallbackContext):
+    if time.time() - context.user_data["otp_time"] > 60:
+        await update.message.reply_text("OTP expired. Please resend OTP.")
+        return RESEND_OTP
+
+    if update.message.text != str(context.user_data["otp"]):
+        await update.message.reply_text("Invalid OTP. Try again.")
+        return VERIFY_OTP
+
+    await update.message.reply_text("OTP verified! Create a password:")
+    return SET_PASSWORD
+
+async def set_password(update: Update, context: CallbackContext):
+    password = update.message.text
+    if not is_valid_password(password):
+        await update.message.reply_text(
+            "Password must be at least 8 characters and include letters, numbers, and symbols."
+        )
+        return SET_PASSWORD
+
+    context.user_data["password"] = password
+    user_data[context.user_data["username"]] = {
+        "name": context.user_data["name"],
+        "phone": context.user_data["phone"],
+        "password": password,
+    }
+    save_user_data()
+    await update.message.reply_text("Account created successfully!/login")
+    return ConversationHandler.END
+
+async def login(update: Update, context: CallbackContext):
+    await update.message.reply_text("Enter your username:")
+    return LOGIN
+
+async def handle_login(update: Update, context: CallbackContext):
+    username = update.message.text
+    if username not in user_data:
+        await update.message.reply_text("Invalid username. Try again or use /help to see available commands.")
+        return LOGIN
+    context.user_data["username"] = username
+    await update.message.reply_text("Enter your password:")
+    return VERIFY_LOGIN
+
+async def verify_login(update: Update, context: CallbackContext):
+    if user_data[context.user_data["username"]]["password"] == update.message.text:
+        logged_in_users.add(update.effective_user.id)
+        await update.message.reply_text(f"Welcome back, {context.user_data['username']}!")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("Incorrect password. Try again.")
+        return VERIFY_LOGIN
+
+# Logout command to temporarily log out a user
+async def logout_command(update: Update, context: CallbackContext):
+    logged_in_users.discard(update.effective_user.id)  # Temporarily remove user from logged-in list
+    await update.message.reply_text(
+        "You have been logged out temporarily. Use /login to log back in anytime."
+    )
+
+# Restart Command
+async def restart(update: Update, context: CallbackContext):
+    """Restarts the bot programmatically."""
+    await update.message.reply_text(
+        "🔄 Restarting the bot... Please wait.\n\n"
+        "After the bot restarts, please send /start to begin again."
+    )
+    
+    # Delay to allow the message to be sent before restarting
+    await asyncio.sleep(2)
+
+    # Restart the bot
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# Image generation function
+async def image_command(update: Update, context: CallbackContext):
+    if await require_login(update, context):
+        return
+
+    if context.args:
+        prompt = " ".join(context.args)
+        
+        # Inform the user about the image generation time
+        await update.message.reply_text(
+            "This process may take a few minutes to generate the image. Please be patient."
+        )
+
+        # Set precision and device preference
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        precision = torch.float16 if device == "cuda" else torch.float32
+
+        # Load lightweight Stable Diffusion pipeline
+        model_id = "stabilityai/stable-diffusion-2-1"
+
+        pipe = StableDiffusionPipeline.from_pretrained(
+            model_id, 
+            torch_dtype=precision,
+            safety_checker=None  # Disable safety checks to reduce processing time
+        )
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        pipe = pipe.to(device)
+
+        # Generate the image with lower resolution
+        image = pipe(prompt, width=512, height=512).images[0]
+
+        # Save the image to a file
+        image_path = "generated_image.png"
+        image.save(image_path)
+
+        # Send the generated image to the user
+        with open(image_path, "rb") as img_file:
+            await update.message.reply_photo(img_file)
+
+        # Remove the saved image file
+        os.remove(image_path)
+    else:
+        await update.message.reply_text("Please provide a prompt after /image to generate an image.")
+
+# Listen command to convert the bot response into audio
+async def listen_command(update: Update, context: CallbackContext):
+    if await require_login(update, context):
+        return
+
+    user_id = update.effective_user.id
+    if user_id not in logged_in_users:
+        await update.message.reply_text("Please log in first using /login.")
+        return
+
+    # Get the bot's last response
+    last_response = context.chat_data.get("last_response", "")
+    
+    if last_response:
+        # Convert text to speech
+        tts = gTTS(last_response, lang="en")
+        audio_file = "response.mp3"
+        tts.save(audio_file)
+        
+        with open(audio_file, "rb") as audio:
+            await update.message.reply_audio(audio)
+        
+        os.remove(audio_file)
+    else:
+        await update.message.reply_text("No response to convert into audio.")
+
+async def removebg_command(update: Update, context: CallbackContext):
+    if await require_login(update, context):
+        return
+
+    context.chat_data["expecting_removebg"] = True  # Set flag for background removal
+    await update.message.reply_text("Send me an image, and I'll remove its background!")
+
+
+async def remove_background(update: Update, context: CallbackContext):
+    try:
+        # Get image file from Telegram
+        file = await update.message.photo[-1].get_file()
+        image_data = await file.download_as_bytearray()
+
+        # Open image and process it
+        image = Image.open(BytesIO(image_data)).convert("RGBA")
+        image = image.resize((800, 800))  # Resize for better processing (optional)
+
+        # Remove background in a separate thread
+        output_image = await asyncio.to_thread(remove, image)
+
+        # Convert processed image to BytesIO
+        output_buffer = BytesIO()
+        output_image.save(output_buffer, format="PNG")  # Save as PNG (keeps transparency)
+        output_buffer.seek(0)  # Reset buffer position for sending
+
+        # Send back image to user
+        await update.message.reply_photo(photo=output_buffer)
+    
+    except Exception as e:
+        print(f"Error removing background: {e}")
+        await update.message.reply_text("An error occurred while removing the background. Please try again.")
+
+def process_image(image_path):
+    # Load image
+    image = cv2.imread(image_path)
+
+    # Convert to grayscale (improves OCR accuracy)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Apply thresholding (helps with text clarity)
+    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    # Save temporary processed image (optional)
+    temp_filename = "temp_processed.png"
+    cv2.imwrite(temp_filename, gray)
+
+    # Perform OCR using Tesseract
+    extracted_text = pytesseract.image_to_string(Image.open(temp_filename), lang='eng')
+
+    return extracted_text
+    
+def handle_photo(update, context):
+    file = context.bot.get_file(update.message.photo[-1].file_id)
+    file_path = "downloaded_image.jpg"
+    file.download(file_path)
+
+    # Process Image
+    text = process_image(file_path)
+
+    # Send extracted text back to the user
+    update.message.reply_text(f"Extracted Text:\n{text}")
+    
+    
+
+# Main function to start the bot
+# Updated Handler Configuration
+def main():
+    load_user_data()
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("create", create_account), CommandHandler("login", login)],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name)],
+            USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)],
+            VERIFY_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_otp)],
+            SET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_password)],
+            LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login)],
+            VERIFY_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_login)],
+            RESEND_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone)],
+        },
+        fallbacks=[],
+    )
+
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("speak", speak_command))
+    application.add_handler(CommandHandler("calc", calc_command))
+    application.add_handler(CommandHandler("image", image_command))
+    application.add_handler(CommandHandler("listen", listen_command))
+    application.add_handler(CommandHandler("removebg", removebg_command))
+    application.add_handler(CommandHandler("logout", logout_command)) 
+    application.add_handler(CommandHandler("restart", restart))
+    
+
+    # Separate handlers for image processing
+    application.add_handler(MessageHandler(filters.PHOTO, handle_image))  # Image text reader
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))  
+
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
